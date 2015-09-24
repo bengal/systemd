@@ -25,13 +25,19 @@
 #include <net/ethernet.h>
 #include <arpa/inet.h>
 
+#include "sd-lldp.h"
+#include "sd-event.h"
+#include "event-util.h"
 #include "macro.h"
 #include "lldp.h"
 #include "lldp-tlv.h"
+#include "lldp-network.h"
 
 #define TEST_LLDP_PORT "em1"
 #define TEST_LLDP_TYPE_SYSTEM_NAME "systemd-lldp"
 #define TEST_LLDP_TYPE_SYSTEM_DESC "systemd-lldp-desc"
+
+static int test_fd[2];
 
 static struct ether_addr mac_addr = {
         .ether_addr_octet = {'A', 'B', 'C', '1', '2', '3'}
@@ -215,17 +221,59 @@ static int lldp_parse_tlv_packet(tlv_packet *m, int len) {
         return 0;
 }
 
-int main(int argc, char *argv[]) {
+static void test_packet_parse(void) {
         _cleanup_tlv_packet_free_ tlv_packet *tlv = NULL;
 
         /* form a packet */
         lldp_build_tlv_packet(&tlv);
-
         /* parse the packet */
         tlv_packet_parse_pdu(tlv, tlv->length);
-
         /* verify */
         lldp_parse_tlv_packet(tlv, tlv->length);
+}
+
+uint8_t basic_tlv_packet[] = {
+        0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e,     /* Destination MAC*/
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06,     /* Source MAC */
+        0x88, 0xcc,                             /* Ethertype */
+        0x02, 0x07, 0x04, 0x01, 0x02, 0x03,     /* Chassis TLV */
+        0x04, 0x05, 0x06,
+        0x04, 0x04, 0x05, 0x31, 0x2f, 0x33,     /* Port TLV*/
+        0x06, 0x02, 0x00, 0x78,                 /* TTL TLV */
+        0x00, 0x00                              /* End Of LLDPDU TLV */
+};
+
+int lldp_network_bind_raw_socket(int ifindex) {
+        if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, test_fd) < 0)
+                return -errno;
+
+        return test_fd[0];
+}
+
+static int lldp_handler_calls;
+static void lldp_handler (sd_lldp *lldp, int event, void *userdata) {
+        lldp_handler_calls++;
+}
+
+static void test_receive(void) {
+        _cleanup_event_unref_ sd_event *e = NULL;
+        sd_lldp *lldp;
+
+        assert_se(sd_event_new(&e) == 0);
+        assert_se(sd_lldp_new(42, "dummy", &mac_addr, &lldp) == 0);
+        assert_se(sd_lldp_attach_event(lldp, e, 0) == 0);
+        assert_se(sd_lldp_set_callback(lldp, lldp_handler, link) == 0);
+        assert_se(sd_lldp_start(lldp) == 0);
+
+        assert_se(write(test_fd[1], basic_tlv_packet, sizeof(basic_tlv_packet)) == sizeof(basic_tlv_packet));
+        sd_event_run(e, 0);
+        assert_se(lldp_handler_calls == 1);
+}
+
+int main(int argc, char *argv[]) {
+
+        test_packet_parse();
+        test_receive();
 
         return 0;
 }
